@@ -1,0 +1,11 @@
+[general]
+name=QGIS GUI Tour
+qgisMinimumVersion=3.0
+description=Ein interaktives Plugin mit allgemeinen Infos zu QGIS und einer geführten Spotlight-Tour durch die Nutzeroberfläche.
+version=1.0
+author=Mario Blersch
+email=mario.blersch@web.de
+about=Dieses Plugin bietet Anfängern eine kurze Tour durch die QGIS-Oberfläche.
+tracker=
+repository=
+category=Plugins
