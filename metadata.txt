@@ -1,11 +1,12 @@
 [general]
-name=QGIS GUI Tour
+name=LearnQGIS-Assistent
 qgisMinimumVersion=3.0
-description=Ein interaktives Plugin mit allgemeinen Infos zu QGIS und einer geführten Spotlight-Tour durch die Nutzeroberfläche.
+description=This plugin provides beginners with a short interactive tour of the QGIS interface and practice exercises.
 version=1.0
 author=Mario Blersch
 email=mario.blersch@web.de
-about=Dieses Plugin bietet Anfängern eine kurze Tour durch die QGIS-Oberfläche.
-tracker=
-repository=
+about=This plugin provides beginners with a short tour of the QGIS interface and interactive exercises.
+tracker=https://github.com/GeowazM/learn_qgis/issues
+repository=https://github.com/GeowazM/learn_qgis
 category=Plugins
+license=GPL version 3
