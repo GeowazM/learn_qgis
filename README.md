@@ -20,7 +20,7 @@ Since this plugin is currently distributed as a `.zip` file, you can install it 
 1. Open QGIS.
 2. Go to **Plugins** > **Manage and Install Plugins...** in the top menu bar.
 3. Select the **Install from ZIP** tab on the left.
-4. Click the `...` button, locate the `qgis_grundlagentour_plugin_v10.zip` file, and select it.
+4. Click the `...` button, locate the `lean_qgis.zip` file, and select it.
 5. Click **Install Plugin**.
 6. Accept any security warnings regarding ZIP installations.
 7. Close the Plugin Manager.
