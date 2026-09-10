@@ -61,7 +61,7 @@ class QgisTourPlugin:
         """
         Initializes the plugin GUI. Registered in the QGIS toolbar and menu.
         """
-        icon_path = os.path.join(self.plugin_dir, "icon.png")
+        icon_path = os.path.join(self.plugin_dir, "owl.svg")
         
         # Create an action that toggles the main learning assistant panel
         self.action_toggle_panel = QAction(
