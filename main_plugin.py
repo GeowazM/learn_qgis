@@ -1,494 +1,403 @@
 """
-Main plugin module for the QGIS Learning Assistant.
-Handles the initialization of the plugin, the UI (DockWidget),
-and the localization logic.
+Logic for the interactive QGIS UI tour.
+Handles the spotlight overlay, interface highlighting, and interactive task checking.
 """
 
-import os
-import webbrowser
-
-from qgis.PyQt.QtCore import Qt
-from qgis.PyQt.QtGui import QIcon
+import qgis.utils
+from qgis.core import QgsProject
+from qgis.PyQt.QtCore import QPoint, QRect, QRectF, Qt, QTimer
+from qgis.PyQt.QtGui import QColor, QPainter, QPainterPath, QRegion
 from qgis.PyQt.QtWidgets import (
-    QAction,
-    QComboBox,
+    QApplication,
     QDockWidget,
     QFrame,
     QLabel,
+    QMessageBox,
     QPushButton,
+    QToolBar,
     QVBoxLayout,
     QWidget,
 )
 
-# Local imports
-from .tour_logic import SpotlightTour, get_interactive_steps, get_spotlight_steps
-
-
-# PyQt6 / PyQt5 compatibility block for Qt Enums to ensure 
-# the plugin works seamlessly across QGIS 3.x and QGIS 4.x
+# PyQt6 / PyQt5 compatibility block for Qt Enums
 try:
-    RIGHT_DOCK = Qt.DockWidgetArea.RightDockWidgetArea
-    LEFT_DOCK = Qt.DockWidgetArea.LeftDockWidgetArea
-    RICH_TEXT = Qt.TextFormat.RichText
+    WIN_TOOL = Qt.WindowType.Tool
+    WIN_FRAMELESS = Qt.WindowType.FramelessWindowHint
+    WIN_TOP = Qt.WindowType.WindowStaysOnTopHint
+    WA_TRANSLUCENT = Qt.WidgetAttribute.WA_TranslucentBackground
+    WA_DELETE = Qt.WidgetAttribute.WA_DeleteOnClose
     HAND_CURSOR = Qt.CursorShape.PointingHandCursor
 except AttributeError:
-    RIGHT_DOCK = Qt.RightDockWidgetArea
-    LEFT_DOCK = Qt.LeftDockWidgetArea
-    RICH_TEXT = Qt.RichText
+    WIN_TOOL = Qt.Tool
+    WIN_FRAMELESS = Qt.FramelessWindowHint
+    WIN_TOP = Qt.WindowStaysOnTopHint
+    WA_TRANSLUCENT = Qt.WA_TranslucentBackground
+    WA_DELETE = Qt.WA_DeleteOnClose
     HAND_CURSOR = Qt.PointingHandCursor
 
 
-class QgisTourPlugin:
+class SpotlightTour(QWidget):
     """
-    Main class for the QGIS Tour Plugin.
-    Manages the plugin lifecycle, UI integration, and user interactions.
+    A transparent overlay widget that highlights specific QGIS UI elements.
     """
 
-    def __init__(self, iface):
-        """
-        Constructor for the plugin.
-        
-        :param iface: Reference to the QGIS interface.
-        """
+    def __init__(self, steps, iface):
+        super().__init__(iface.mainWindow())
+        self.steps = steps
+        self.current_step = 0
         self.iface = iface
-        self.plugin_dir = os.path.dirname(__file__)
-        self.action_toggle_panel = None
-        self.dock_widget = None
-        self.tour_instance = None
-        self.current_exercise = 1
-
-    def initGui(self):
-        """
-        Initializes the plugin GUI. Registered in the QGIS toolbar and menu.
-        """
-        icon_path = os.path.join(self.plugin_dir, "owl.svg")
+        self.interactive_mode = False
+        self.layer_added_flag = False
         
-        # Create an action that toggles the main learning assistant panel
-        self.action_toggle_panel = QAction(
-            QIcon(icon_path), 
-            "QGIS Lern-Assistent öffnen", 
-            self.iface.mainWindow()
-        )
-        self.action_toggle_panel.triggered.connect(self.toggle_panel)
+        # Listen for newly added layers (used for task validation)
+        QgsProject.instance().layersAdded.connect(self.on_layer_added)
         
-        # Add the action to the QGIS interface
-        self.iface.addToolBarIcon(self.action_toggle_panel)
-        self.iface.addPluginToMenu("&QGIS Tour", self.action_toggle_panel)
-
-    def unload(self):
-        """
-        Cleans up the plugin UI when the plugin is disabled or uninstalled.
-        """
-        self.iface.removePluginMenu("&QGIS Tour", self.action_toggle_panel)
-        self.iface.removeToolBarIcon(self.action_toggle_panel)
-        if self.dock_widget:
-            self.iface.removeDockWidget(self.dock_widget)
-
-    def toggle_panel(self):
-        """
-        Toggles the visibility of the DockWidget. Creates it if it doesn't exist.
-        """
-        if not self.dock_widget:
-            self.create_dock_widget()
+        # Apply the cross-platform Qt window flags
+        self.setWindowFlags(WIN_TOOL | WIN_FRAMELESS | WIN_TOP)
+        self.setAttribute(WA_TRANSLUCENT)
+        self.setAttribute(WA_DELETE)
         
-        if self.dock_widget.isVisible():
-            self.dock_widget.hide()
+        main_window = self.iface.mainWindow()
+        self.setGeometry(0, 0, main_window.width(), main_window.height())
+        
+        # --- Close Button ---
+        self.close_btn = QPushButton("Tour beenden", self)
+        self.close_btn.setCursor(HAND_CURSOR)
+        self.close_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #e74c3c; 
+                color: white; 
+                font-weight: bold; 
+                padding: 8px 15px; 
+                border-radius: 4px; 
+                border: 2px solid #c0392b;
+            }
+            QPushButton:hover { background-color: #c0392b; }
+        """)
+        self.close_btn.clicked.connect(self.close)
+        self.close_btn.move(self.width() - self.close_btn.width() - 30, 30)
+        
+        # --- Information Bubble ---
+        self.bubble = QFrame(self)
+        self.bubble.setStyleSheet("""
+            QFrame {
+                background-color: #ffffff;
+                border: 2px solid #2c3e50;
+                border-radius: 8px;
+                padding: 15px;
+            }
+            QLabel { font-size: 14px; color: #333333; margin-bottom: 10px; }
+            QPushButton { 
+                font-size: 13px; font-weight: bold; padding: 8px; 
+                background-color: #3498db; color: white; 
+                border: none; border-radius: 4px;
+            }
+            QPushButton:hover { background-color: #2980b9; }
+        """)
+        layout = QVBoxLayout(self.bubble)
+        self.text_label = QLabel()
+        self.text_label.setWordWrap(True)
+        self.text_label.setFixedWidth(280)
+        layout.addWidget(self.text_label)
+        
+        self.next_btn = QPushButton("Weiter")
+        self.next_btn.setCursor(HAND_CURSOR)
+        self.next_btn.clicked.connect(self.next_step)
+        layout.addWidget(self.next_btn)
+        
+        self.target_rect = QRect()
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.check_conditions)
+        
+        self.show_step()
+
+    def on_layer_added(self, layers):
+        """Callback triggered when a new layer is added to the project."""
+        self.layer_added_flag = True
+
+    def resizeEvent(self, event):
+        """Ensures the close button stays anchored to the top right."""
+        self.close_btn.move(self.width() - self.close_btn.width() - 30, 30)
+        super().resizeEvent(event)
+
+    def next_step(self):
+        """Advances the tour to the next step or closes it if finished."""
+        self.current_step += 1
+        if self.current_step >= len(self.steps):
+            self.close()
         else:
-            self.dock_widget.show()
+            self.show_step()
 
-    def create_dock_widget(self):
-        """
-        Creates and assembles the right-side DockWidget panel containing
-        the language selector, tour buttons, and the interactive exercise area.
-        """
-        self.dock_widget = QDockWidget("QGIS Lern-Assistent", self.iface.mainWindow())
-        self.dock_widget.setObjectName("QgisTourDockWidget")
-        self.dock_widget.setAllowedAreas(RIGHT_DOCK | LEFT_DOCK)
-        
-        container = QWidget()
-        layout = QVBoxLayout()
-        
-        # --- Language Selection ---
-        self.lbl_lang = QLabel("Sprache / Language:")
-        self.lang_combo = QComboBox()
-        self.lang_combo.addItems(["Deutsch", "English", "Español"])
-        
-        # --- Tour Buttons ---
-        self.lbl_tours = QLabel("<b>Verfügbare Touren:</b>")
-        
-        self.btn_tour_ui = QPushButton("1. Bedienoberfläche kennenlernen")
-        self.btn_tour_ui.clicked.connect(self.start_ui_tour)
-        
-        self.btn_tour_interact = QPushButton("2. Interaktive Anleitung (Hintergrundkarte)")
-        self.btn_tour_interact.clicked.connect(self.start_interactive_tour)
+    def update_mask(self):
+        """Creates click-through areas on the overlay."""
+        region = QRegion(self.bubble.geometry())
+        region = region.united(QRegion(self.close_btn.geometry()))
+        self.setMask(region)
 
-        self.btn_tour_exercise_1 = QPushButton("3. Übungsaufgabe (Puffer-Analyse)")
-        self.btn_tour_exercise_1.clicked.connect(lambda: self.start_exercise_tour(1))
-
-        self.btn_tour_exercise_2 = QPushButton("4. Übungsaufgabe (Erdbeben & Tektonik)")
-        self.btn_tour_exercise_2.clicked.connect(lambda: self.start_exercise_tour(2))
+    def show_step(self):
+        """Renders the current step's widget highlight and text bubble."""
+        step = self.steps[self.current_step]
+        target_widget = step.get('widget')
+        text = step['text']
+        self.interactive_mode = step.get('interactive', False)
         
-        self.btn_tour_exercise_3 = QPushButton("5. Übungsaufgabe (Vulkane & Rasterdaten)")
-        self.btn_tour_exercise_3.clicked.connect(lambda: self.start_exercise_tour(3))
-        
-        layout.addWidget(self.lbl_lang)
-        layout.addWidget(self.lang_combo)
-        layout.addSpacing(20)
-        layout.addWidget(self.lbl_tours)
-        layout.addWidget(self.btn_tour_ui)
-        layout.addWidget(self.btn_tour_interact)
-        layout.addWidget(self.btn_tour_exercise_1)
-        layout.addWidget(self.btn_tour_exercise_2)
-        layout.addWidget(self.btn_tour_exercise_3)
-        
-        # --- SEPARATED AREA FOR EXERCISES (MyST Style) ---
-        self.exercise_frame = QFrame()
-        self.exercise_frame.setObjectName("ExerciseFrame")
-        self.exercise_frame.setStyleSheet(
-            "#ExerciseFrame { border-top: 2px solid #bdc3c7; "
-            "margin-top: 15px; padding-top: 10px; }"
-        )
-        self.exercise_frame.setVisible(False)
-        
-        ex_layout = QVBoxLayout(self.exercise_frame)
-        ex_layout.setContentsMargins(0, 0, 0, 0)
-        
-        self.lbl_ex_title = QLabel()
-        
-        # Scenario Description (MyST 'Note' Admonition mimicking)
-        self.lbl_ex_desc = QLabel()
-        self.lbl_ex_desc.setWordWrap(True)
-        self.lbl_ex_desc.setTextFormat(RICH_TEXT)
-        
-        # Hint Toggle Button
-        self.btn_ex_hint = QPushButton("Tipp anzeigen")
-        self.btn_ex_hint.setCursor(HAND_CURSOR)
-        self.btn_ex_hint.clicked.connect(self.toggle_hint)
-        
-        # Hint Description (MyST 'Tip' Admonition mimicking)
-        self.lbl_ex_hint = QLabel()
-        self.lbl_ex_hint.setWordWrap(True)
-        self.lbl_ex_hint.setTextFormat(RICH_TEXT)
-        self.lbl_ex_hint.setVisible(False)
-        
-        # Solution Link
-        self.lbl_ex_link = QLabel()
-        self.lbl_ex_link.setOpenExternalLinks(True)
-        
-        # Download Button (Used for specific exercises like Exercise 5)
-        self.btn_download_data = QPushButton("Geodaten für Aufgabe Vulkane herunterladen")
-        self.btn_download_data.setCursor(HAND_CURSOR)
-        self.btn_download_data.setStyleSheet(
-            "background-color: #27ae60; color: white; font-weight: bold;"
-        )
-        self.btn_download_data.clicked.connect(self.open_download_link)
-        self.btn_download_data.setVisible(False)
-        
-        # Assemble the exercise layout
-        ex_layout.addWidget(self.lbl_ex_title)
-        ex_layout.addSpacing(5)
-        ex_layout.addWidget(self.lbl_ex_desc)
-        ex_layout.addWidget(self.btn_download_data)
-        ex_layout.addSpacing(10)
-        ex_layout.addWidget(self.btn_ex_hint)
-        ex_layout.addWidget(self.lbl_ex_hint)
-        ex_layout.addSpacing(10)
-        ex_layout.addWidget(self.lbl_ex_link)
-        
-        layout.addWidget(self.exercise_frame)
-        # ------------------------------------------------
-
-        layout.addStretch()
-        
-        container.setLayout(layout)
-        self.dock_widget.setWidget(container)
-        self.iface.addDockWidget(RIGHT_DOCK, self.dock_widget)
-        
-        # Connect language change event and initialize text
-        self.lang_combo.currentIndexChanged.connect(self.update_ui_texts)
-        self.update_ui_texts()
-
-    def toggle_hint(self):
-        """Toggles the visibility of the exercise hint."""
-        is_visible = self.lbl_ex_hint.isVisible()
-        self.lbl_ex_hint.setVisible(not is_visible)
-
-    def get_lang_code(self):
-        """Returns the internal language code based on dropdown selection."""
-        lang = self.lang_combo.currentText()
-        if lang == "English": 
-            return "en"
-        if lang == "Español": 
-            return "es"
-        return "de"
-        
-    def update_ui_texts(self):
-        """Updates the static UI text based on the selected language."""
-        code = self.get_lang_code()
-        
-        if code == "en":
-            self.dock_widget.setWindowTitle("QGIS Learning Assistant")
-            self.lbl_lang.setText("Language:")
-            self.lbl_tours.setText("<b>Available Tours:</b>")
-            self.btn_tour_ui.setText("1. Get to know the Interface")
-            self.btn_tour_interact.setText("2. Interactive Guide (Basemap)")
-            self.btn_tour_exercise_1.setText("3. Exercise (Buffer Analysis)")
-            self.btn_tour_exercise_2.setText("4. Exercise (Earthquakes & Tectonics)")
-            self.btn_tour_exercise_3.setText("5. Exercise (Volcanoes & Rasters)")
-            self.btn_ex_hint.setText("Toggle Hint")
-            self.btn_download_data.setText("Download Geodata for Volcanoes Exercise")
+        # 1. Update text content
+        self.text_label.setText(text)
+        self.next_btn.setText(step.get('btn_next', 'Weiter'))
+        self.close_btn.setText(step.get('btn_end_tour', 'Tour beenden'))
+        if self.current_step == len(self.steps) - 1 and not self.interactive_mode:
+            self.next_btn.setText(step.get('btn_end', 'Beenden'))
             
-        elif code == "es":
-            self.dock_widget.setWindowTitle("Asistente de Aprendizaje")
-            self.lbl_lang.setText("Idioma:")
-            self.lbl_tours.setText("<b>Tours Disponibles:</b>")
-            self.btn_tour_ui.setText("1. Conocer la Interfaz")
-            self.btn_tour_interact.setText("2. Guía Interactiva (Mapa base)")
-            self.btn_tour_exercise_1.setText("3. Ejercicio (Análisis de zona de influencia)")
-            self.btn_tour_exercise_2.setText("4. Ejercicio (Terremotos y Tectónica)")
-            self.btn_tour_exercise_3.setText("5. Ejercicio (Volcanes y Rasters)")
-            self.btn_ex_hint.setText("Mostrar/Ocultar Pista")
-            self.btn_download_data.setText("Descargar datos para el ejercicio de volcanes")
-            
+        if self.interactive_mode:
+            self.next_btn.hide()
         else:
-            self.dock_widget.setWindowTitle("QGIS Lern-Assistent")
-            self.lbl_lang.setText("Sprache / Language:")
-            self.lbl_tours.setText("<b>Verfügbare Touren:</b>")
-            self.btn_tour_ui.setText("1. Bedienoberfläche kennenlernen")
-            self.btn_tour_interact.setText("2. Interaktives Anleiten (Hintergrundkarte)")
-            self.btn_tour_exercise_1.setText("3. Übungsaufgabe (Puffer-Analyse)")
-            self.btn_tour_exercise_2.setText("4. Übungsaufgabe (Erdbeben & Tektonik)")
-            self.btn_tour_exercise_3.setText("5. Übungsaufgabe (Vulkane & Rasterdaten)")
-            self.btn_ex_hint.setText("Tipp ein-/ausblenden")
-            self.btn_download_data.setText("Geodaten für Aufgabe Vulkane herunterladen")
+            self.next_btn.show()
             
-        # Ensure the active exercise text gets updated as well
-        self.update_exercise_texts()
-
-    def update_exercise_texts(self):
-        """Updates the dynamic exercise content based on selected language and exercise."""
-        code = self.get_lang_code()
+        # 2. Adjust bubble size to fit new text
+        self.bubble.adjustSize()
         
-        # CSS Styles mimicking MyST Admonitions
-        myst_note_style = (
-            "background-color: #ebf5fb; border-left: 4px solid #3498db; "
-            "padding: 10px; border-radius: 0px 4px 4px 0px; margin: 5px 0px;"
-        )
-        myst_tip_style = (
-            "background-color: #e8f8f5; border-left: 4px solid #1abc9c; "
-            "padding: 10px; border-radius: 0px 4px 4px 0px; margin: 5px 0px;"
-        )
-
-        # Show download button only for Exercise 3
-        self.btn_download_data.setVisible(self.current_exercise == 3)
-
-        # Content generation based on the active exercise
-        if self.current_exercise == 1:
-            if code == "en":
-                self.lbl_ex_title.setText("<b>Exercise 3: Buffer Analysis</b>")
-                self.lbl_ex_desc.setText(
-                    f"<div style='{myst_note_style}'><b style='color:#2980b9;'>📝 Scenario</b><br><br>"
-                    f"We want to identify buildings that are too close to a road. Find a road layer "
-                    f"and a building layer. Buffer the roads by 50 meters and identify the buildings "
-                    f"that fall into this buffer zone.</div>"
-                )
-                self.lbl_ex_hint.setText(
-                    f"<div style='{myst_tip_style}'><b style='color:#16a085;'>💡 Tip</b><br><br>"
-                    f"Open 'Vector > Geoprocessing Tools > Buffer' to buffer the roads. Then use "
-                    f"'Vector > Research Tools > Select by Location' to find intersecting buildings.</div>"
-                )
-                self.lbl_ex_link.setText(
-                    "<a href='https://docs.qgis.org/3.44/en/docs/gentle_gis_introduction/"
-                    "vector_spatial_analysis_buffers.html#now-you-try' style='color: #2980b9; "
-                    "text-decoration: none;'><b>➤ View Solution in QGIS Docs</b></a>"
-                )
-            elif code == "es":
-                self.lbl_ex_title.setText("<b>Ejercicio 3: Análisis de zona de influencia</b>")
-                self.lbl_ex_desc.setText(
-                    f"<div style='{myst_note_style}'><b style='color:#2980b9;'>📝 Escenario</b><br><br>"
-                    f"Queremos identificar edificios que están demasiado cerca de una carretera. "
-                    f"Cree un área de influencia (buffer) de 50 metros alrededor de las carreteras "
-                    f"e identifique qué edificios caen dentro de esta zona.</div>"
-                )
-                self.lbl_ex_hint.setText(
-                    f"<div style='{myst_tip_style}'><b style='color:#16a085;'>💡 Pista</b><br><br>"
-                    f"Use 'Vectorial > Herramientas de geoproceso > Buffer' para las carreteras. "
-                    f"Luego use 'Selección por localización' para encontrar los edificios.</div>"
-                )
-                self.lbl_ex_link.setText(
-                    "<a href='https://docs.qgis.org/3.44/es/docs/gentle_gis_introduction/"
-                    "vector_spatial_analysis_buffers.html#now-you-try' style='color: #2980b9; "
-                    "text-decoration: none;'><b>➤ Ver solución en la documentación</b></a>"
-                )
+        # 3. Position the bubble and handle the overlay mask
+        if self.interactive_mode:
+            # Center the bubble in the upper third of the screen for interactive tasks
+            bubble_x = (self.width() - self.bubble.width()) // 2
+            bubble_y = max(50, (self.height() - self.bubble.height()) // 3)
+            self.bubble.move(bubble_x, bubble_y)
+            
+            self.target_rect = QRect()
+            self.update_mask()
+            self.timer.start(1000)
+        else:
+            self.timer.stop()
+            self.clearMask()
+            
+            if target_widget and target_widget.isVisible():
+                global_pos = target_widget.mapToGlobal(QPoint(0, 0))
+                local_pos = self.mapFromGlobal(global_pos)
+                self.target_rect = QRect(local_pos, target_widget.size())
+                
+                # Try positioning the bubble to the right of the highlighted widget
+                bubble_x = self.target_rect.right() + 20
+                bubble_y = self.target_rect.top() + 20
+                
+                # Prevent horizontal overflow
+                if bubble_x + self.bubble.width() > self.width():
+                    bubble_x = self.target_rect.left() - self.bubble.width() - 20
+                
+                # Fallback to vertical positioning if horizontal fails
+                if bubble_x < 0:
+                    bubble_x = (self.width() - self.bubble.width()) // 2
+                    if self.target_rect.center().y() < self.height() // 2:
+                        bubble_y = self.target_rect.bottom() + 20
+                    else:
+                        bubble_y = self.target_rect.top() - self.bubble.height() - 20
+                        
+                # Prevent vertical overflow
+                if bubble_y + self.bubble.height() > self.height():
+                    bubble_y = self.height() - self.bubble.height() - 20
+                if bubble_y < 0:
+                    bubble_y = 20
+                    
+                self.bubble.move(bubble_x, bubble_y)
             else:
-                self.lbl_ex_title.setText("<b>Übungsaufgabe 3: Puffer-Analyse</b>")
-                self.lbl_ex_desc.setText(
-                    f"<div style='{myst_note_style}'><b style='color:#2980b9;'>📝 Szenario</b><br><br>"
-                    f"Wir möchten herausfinden, welche Gebäude sich zu nah an einer Hauptstraße befinden. "
-                    f"Puffern Sie eine Straßen-Ebene mit 50 Metern und finden Sie heraus, welche Gebäude "
-                    f"in diese Pufferzone fallen.</div>"
+                self.target_rect = QRect()
+                self.bubble.move(
+                    (self.width() - self.bubble.width()) // 2, 
+                    (self.height() - self.bubble.height()) // 2
                 )
-                self.lbl_ex_hint.setText(
-                    f"<div style='{myst_tip_style}'><b style='color:#16a085;'>💡 Tipp</b><br><br>"
-                    f"Nutzen Sie das Werkzeug 'Puffer' (Vektor > Geoverarbeitungswerkzeuge > Puffer). "
-                    f"Verwenden Sie danach 'Nach Ort auswählen' (Vektor > Forschungswerkzeuge), "
-                    f"um Gebäude zu markieren.</div>"
-                )
-                self.lbl_ex_link.setText(
-                    "<a href='https://docs.qgis.org/3.44/de/docs/gentle_gis_introduction/"
-                    "vector_spatial_analysis_buffers.html#now-you-try' style='color: #2980b9; "
-                    "text-decoration: none;'><b>➤ Lösung in QGIS-Doku ansehen</b></a>"
-                )
+
+        self.update()
+
+    def check_conditions(self):
+        """Regularly checks if the user has completed the interactive task."""
+        step = self.steps[self.current_step]
+        cond_func = step.get('condition_check')
         
-        elif self.current_exercise == 2:
-            if code == "en":
-                self.lbl_ex_title.setText("<b>Exercise 4: Earthquakes & Tectonics</b>")
-                self.lbl_ex_desc.setText(
-                    f"<div style='{myst_note_style}'><b style='color:#2980b9;'>📝 Scenario</b><br><br>"
-                    f"We want to investigate the distribution of earthquakes in relation to tectonic "
-                    f"plate boundaries. Download the corresponding vector data and add it to QGIS. "
-                    f"Adjust the earthquake symbology (e.g., scale point size by magnitude).</div>"
-                )
-                self.lbl_ex_hint.setText(
-                    f"<div style='{myst_tip_style}'><b style='color:#16a085;'>💡 Tip</b><br><br>"
-                    f"Use the 'Data Source Manager' to add the vector layers. Go to 'Layer Properties "
-                    f"> Symbology' to change the styling (e.g., use 'Graduated' scaling).</div>"
-                )
-                self.lbl_ex_link.setText(
-                    "<a href='https://einfuhrung-gis-fur-geowissenschaften.readthedocs.io/"
-                    "en/latest/lessons/L1/exercise-1-tectonicplates.html' style='color: #2980b9; "
-                    "text-decoration: none;'><b>➤ View Exercise Tutorial</b></a>"
-                )
-            elif code == "es":
-                self.lbl_ex_title.setText("<b>Ejercicio 4: Terremotos y Tectónica</b>")
-                self.lbl_ex_desc.setText(
-                    f"<div style='{myst_note_style}'><b style='color:#2980b9;'>📝 Escenario</b><br><br>"
-                    f"Queremos investigar la distribución de los terremotos en relación con los límites "
-                    f"de las placas tectónicas. Descargue los datos vectoriales y añádalos a QGIS. "
-                    f"Ajuste la simbología de los terremotos.</div>"
-                )
-                self.lbl_ex_hint.setText(
-                    f"<div style='{myst_tip_style}'><b style='color:#16a085;'>💡 Pista</b><br><br>"
-                    f"Utilice el 'Administrador de fuentes de datos' para añadir las capas vectoriales. "
-                    f"Vaya a 'Propiedades > Simbología' para cambiar el estilo ('Graduado').</div>"
-                )
-                self.lbl_ex_link.setText(
-                    "<a href='https://einfuhrung-gis-fur-geowissenschaften.readthedocs.io/"
-                    "es/latest/lessons/L1/exercise-1-tectonicplates.html' style='color: #2980b9; "
-                    "text-decoration: none;'><b>➤ Ver Ejercicio en el Tutorial</b></a>"
-                )
+        if cond_func and cond_func(self):
+            self.timer.stop()
+            if self.current_step == len(self.steps) - 1:
+                msg = step.get('success_msg', "Erfolg!")
+                title = step.get('success_title', "Glückwunsch!")
+                QMessageBox.information(self.iface.mainWindow(), title, msg)
+                self.close()
             else:
-                self.lbl_ex_title.setText("<b>Übungsaufgabe 4: Erdbeben & Tektonik</b>")
-                self.lbl_ex_desc.setText(
-                    f"<div style='{myst_note_style}'><b style='color:#2980b9;'>📝 Szenario</b><br><br>"
-                    f"Wir wollen die Verteilung von Erdbeben im Zusammenhang mit tektonischen "
-                    f"Plattengrenzen untersuchen. Laden Sie die bereitgestellten Vektordaten "
-                    f"herunter und passen Sie die Darstellung an.</div>"
-                )
-                self.lbl_ex_hint.setText(
-                    f"<div style='{myst_tip_style}'><b style='color:#16a085;'>💡 Tipp</b><br><br>"
-                    f"Nutzen Sie den Datenquellenverwalter (Strg+L), um die Daten hinzuzufügen. "
-                    f"Unter 'Layer-Eigenschaften > Symbolisierung' können Sie die Darstellung "
-                    f"auf 'Abgestuft' stellen.</div>"
-                )
-                self.lbl_ex_link.setText(
-                    "<a href='https://einfuhrung-gis-fur-geowissenschaften.readthedocs.io/"
-                    "de/latest/lessons/L1/exercise-1-tectonicplates.html' style='color: #2980b9; "
-                    "text-decoration: none;'><b>➤ Übung im Tutorial ansehen</b></a>"
-                )
+                self.next_step()
 
-        elif self.current_exercise == 3:
-            if code == "en":
-                self.lbl_ex_title.setText("<b>Exercise 5: Volcanoes & Raster Data</b>")
-                self.lbl_ex_desc.setText(
-                    f"<div style='{myst_note_style}'><b style='color:#2980b9;'>📝 Scenario</b><br><br>"
-                    f"Let's investigate volcanoes and topographic features. Use the button below "
-                    f"to download the dataset and load it into QGIS. Afterwards, follow the tutorial "
-                    f"to adjust the symbology.</div>"
-                )
-                self.lbl_ex_hint.setText(
-                    f"<div style='{myst_tip_style}'><b style='color:#16a085;'>💡 Tip</b><br><br>"
-                    f"Once the raster layer (DEM) is loaded, go to 'Symbology' and change the render "
-                    f"type to 'Singleband pseudocolor' to apply a color ramp.</div>"
-                )
-                self.lbl_ex_link.setText(
-                    "<a href='https://einfuhrung-gis-fur-geowissenschaften.readthedocs.io/"
-                    "en/latest/lessons/L3/exercise-3-vulcanoes.html' style='color: #2980b9; "
-                    "text-decoration: none;'><b>➤ View Exercise Tutorial</b></a>"
-                )
-            elif code == "es":
-                self.lbl_ex_title.setText("<b>Ejercicio 5: Volcanes y Datos Raster</b>")
-                self.lbl_ex_desc.setText(
-                    f"<div style='{myst_note_style}'><b style='color:#2980b9;'>📝 Escenario</b><br><br>"
-                    f"Investiguemos los volcanes y la topografía. Use el botón abajo para descargar "
-                    f"los datos y cargarlos en QGIS. Luego siga el tutorial para ajustar la simbología.</div>"
-                )
-                self.lbl_ex_hint.setText(
-                    f"<div style='{myst_tip_style}'><b style='color:#16a085;'>💡 Pista</b><br><br>"
-                    f"Una vez cargado el raster (DEM), vaya a 'Simbología' y cambie el tipo a "
-                    f"'Pseudocolor monobanda' para aplicar una rampa de color.</div>"
-                )
-                self.lbl_ex_link.setText(
-                    "<a href='https://einfuhrung-gis-fur-geowissenschaften.readthedocs.io/"
-                    "es/latest/lessons/L3/exercise-3-vulcanoes.html' style='color: #2980b9; "
-                    "text-decoration: none;'><b>➤ Ver Ejercicio en el Tutorial</b></a>"
-                )
-            else:
-                self.lbl_ex_title.setText("<b>Übungsaufgabe 5: Vulkane & Rasterdaten</b>")
-                self.lbl_ex_desc.setText(
-                    f"<div style='{myst_note_style}'><b style='color:#2980b9;'>📝 Szenario</b><br><br>"
-                    f"Wir untersuchen Vulkane in Kombination mit topografischen Rasterdaten. "
-                    f"Nutzen Sie den Button, um die ZIP-Datei herunterzuladen. Entpacken Sie diese "
-                    f"und laden Sie die Daten in QGIS.</div>"
-                )
-                self.lbl_ex_hint.setText(
-                    f"<div style='{myst_tip_style}'><b style='color:#16a085;'>💡 Tipp</b><br><br>"
-                    f"Sobald das Raster (DEM) geladen ist, gehen Sie in die Symbolisierung und "
-                    f"stellen Sie den Darstellungsstil auf 'Einkanalpeudofarbe' um.</div>"
-                )
-                self.lbl_ex_link.setText(
-                    "<a href='https://einfuhrung-gis-fur-geowissenschaften.readthedocs.io/"
-                    "de/latest/lessons/L3/exercise-3-vulcanoes.html' style='color: #2980b9; "
-                    "text-decoration: none;'><b>➤ Übung im Tutorial ansehen</b></a>"
-                )
-
-    def close_active_tour(self):
-        """Safely closes any active SpotlightTour instance."""
-        if self.tour_instance:
-            try:
-                self.tour_instance.close()
-            except Exception:
-                pass
-
-    def start_ui_tour(self):
-        """Initiates the basic UI introduction tour."""
-        self.close_active_tour()
-        self.exercise_frame.setVisible(False)
-        steps = get_spotlight_steps(self.iface, self.get_lang_code())
-        self.tour_instance = SpotlightTour(steps, self.iface)
-        self.tour_instance.show()
+    def paintEvent(self, event):
+        """Paints the dark overlay with a cutout for the target widget."""
+        if self.interactive_mode:
+            return
+            
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        path = QPainterPath()
+        path.addRect(0, 0, self.width(), self.height())
         
-    def start_interactive_tour(self):
-        """Initiates the interactive task tour (e.g., Basemap setup)."""
-        self.close_active_tour()
-        self.exercise_frame.setVisible(False)
-        steps = get_interactive_steps(self.iface, self.get_lang_code())
-        self.tour_instance = SpotlightTour(steps, self.iface)
-        self.tour_instance.show()
+        if not self.target_rect.isNull():
+            cutout = QPainterPath()
+            rect = self.target_rect.adjusted(-4, -4, 4, 4)
+            cutout.addRoundedRect(QRectF(rect), 8, 8)
+            path = path.subtracted(cutout)
+            
+        painter.fillPath(path, QColor(0, 0, 0, 160))
+        painter.end()
 
-    def start_exercise_tour(self, ex_num):
-        """
-        Activates a specific exercise frame and updates its localized text.
+    def closeEvent(self, event):
+        """Cleanup upon closing the tour overlay."""
+        self.timer.stop()
+        try:
+            QgsProject.instance().layersAdded.disconnect(self.on_layer_added)
+        except Exception:
+            pass
+        super().closeEvent(event)
+
+
+# --- Helper Functions for Interactive Conditions ---
+
+def is_plugin_manager_open(tour):
+    """Checks if the QGIS Plugin Manager window is currently open."""
+    for w in QApplication.topLevelWidgets():
+        if w.objectName() == "QgsPluginManager" and w.isVisible():
+            return True
+    return False
+
+def is_qms_installed_and_closed(tour):
+    """Verifies that QuickMapServices is installed and the Plugin Manager is closed."""
+    installed = "quick_map_services" in qgis.utils.plugins
+    manager_closed = not is_plugin_manager_open(tour)
+    return installed and manager_closed
+
+def check_layer_added(tour):
+    """Checks if a new layer was successfully added to the canvas."""
+    return tour.layer_added_flag
+
+
+# --- Localization and Content Logic ---
+
+def get_texts(lang):
+    """Returns localized strings for the tours based on selected language."""
+    texts = {
+        "de": {
+            "menu": "1. Die Menüleiste\n\nHier finden Sie Zugriff auf alle Funktionen von QGIS, aufgeteilt in Standardmenüs wie Projekt, Bearbeiten, Ansicht, Layer etc.",
+            "toolbars": "2. Werkzeugleisten\n\nDiese Leisten bieten Schnellzugriff auf die wichtigsten Funktionen. Sie können frei verschoben oder über einen Rechtsklick ein-/ausgeblendet werden.",
+            "browser": "3. Bedienfelder: Der Browser\n\nIhr Dateimanager für Geodaten. Ziehen Sie Dateien einfach per Drag & Drop in das Kartenfenster.",
+            "layers": "4. Bedienfelder: Das Layer-Bedienfeld\n\nHier steuern Sie, welche Daten sichtbar sind. Mit den Häkchen schalten Sie Ebenen ein und aus. Die obere Ebene verdeckt die darunterliegende.",
+            "canvas": "5. Die Kartenansicht\n\nHier findet die Magie statt! Alle Ihre Geodaten werden in diesem zentralen Fenster visuell als eigentliche Karte dargestellt.",
+            "dock": "6. Plugin- & Analyse-Fenster\n\nHier werden die Fenster von Plugins (wie dieser Assistent) oder bspw. auch die Verarbeitungswerkzeugkiste geöffnet.",
+            "statusbar": "7. Die Statusleiste\n\nHier unten finden Sie wichtige Projektinfos: die Locator-Suchleiste (links), den Maßstab, die Maus-Koordinaten und rechts die Projektion (KBS).",
+            "open_plugin_manager": "<b>📍 INTERAKTIVE AUFGABE</b><br><br>Bitte klicken Sie nun oben im Hauptmenü auf <b>Erweiterungen</b> > <b>Erweiterungen verwalten und installieren...</b>",
+            "install_qms": "<b>📍 INTERAKTIVE AUFGABE</b><br><br>Suchen Sie im neuen Fenster nach <b>QuickMapServices</b>.<br>Klicken Sie auf <b>Erweiterung installieren</b> und schließen Sie das Fenster danach.",
+            "add_basemap": "<b>📍 INTERAKTIVE AUFGABE</b><br><br>Klicken Sie nun im Hauptmenü auf <b>Web</b> > <b>QuickMapServices</b> und wählen Sie eine Karte (z.B. OSM Standard) aus.",
+            "success_title": "Glückwunsch!",
+            "success": "Sie haben erfolgreich ein Plugin installiert und eine Hintergrundkarte zum Projekt hinzugefügt.",
+            "next": "Weiter",
+            "end": "Tour beenden",
+            "end_tour_btn": "Tour abbrechen"
+        },
+        "en": {
+            "menu": "1. Menu Bar\n\nProvides access to all QGIS features using standard hierarchical menus like Project, Edit, View, Layer, etc.",
+            "toolbars": "2. Toolbars\n\nProvide quick access to most of the same functions as the menus. They can be moved around or toggled via right-click.",
+            "browser": "3. Panels: Browser\n\nYour file manager for spatial data. Drag & drop files directly into the Map Canvas.",
+            "layers": "4. Panels: Layers\n\nControl which data is visible. Use the checkboxes to toggle visibility. Top layers cover the ones below.",
+            "canvas": "5. Map View\n\nThis is where the magic happens! All your spatial data are visually displayed here as the actual map.",
+            "dock": "6. Plugin & Analysis Panels\n\nHere you will find windows opened by plugins (like this Assistant) or, for example, the Processing Toolbox.",
+            "statusbar": "7. Status Bar\n\nDown here you can see the Locator bar, current map scale, coordinates, and the Coordinate Reference System (CRS) of your project.",
+            "open_plugin_manager": "<b>📍 INTERACTIVE TASK</b><br><br>Please click on <b>Plugins</b> > <b>Manage and Install Plugins...</b> in the main menu.",
+            "install_qms": "<b>📍 INTERACTIVE TASK</b><br><br>Search for <b>QuickMapServices</b> in the Plugin Manager.<br>Click install and close the window afterwards.",
+            "add_basemap": "<b>📍 INTERACTIVE TASK</b><br><br>Now click on <b>Web</b> > <b>QuickMapServices</b> in the main menu and select a basemap (e.g. OSM Standard) to add it.",
+            "success_title": "Congratulations!",
+            "success": "You have installed a plugin and added a basemap to your project.",
+            "next": "Next",
+            "end": "Finish Tour",
+            "end_tour_btn": "Cancel Tour"
+        },
+        "es": {
+            "menu": "1. Barra de Menú\n\nProporciona acceso a todas las funciones mediante menús jerárquicos como Proyecto, Edición, Ver, etc.",
+            "toolbars": "2. Barras de Herramientas\n\nAcceso rápido a las funciones más utilizadas. Se pueden mover o activar/desactivar con clic derecho.",
+            "browser": "3. Paneles: Navegador\n\nSu administrador de archivos de datos espaciales. Arrastre archivos al lienzo del mapa.",
+            "layers": "4. Paneles: Capas\n\nControle qué datos son visibles. La capa superior cubre las inferiores.",
+            "canvas": "5. Vista del Mapa\n\n¡Aquí ocurre la magia! Todos sus datos espaciales se muestran visualmente aquí.",
+            "dock": "6. Paneles de Complementos\n\nAquí se abren las ventanas de los complementos (como este Asistente) o, por ejemplo, la Caja de herramientas de procesos.",
+            "statusbar": "7. Barra de Estado\n\nAquí encontrará la barra localizadora, la escala, las coordenadas y el SRC del proyecto.",
+            "open_plugin_manager": "<b>📍 TAREA INTERACTIVA</b><br><br>Haga clic en <b>Complementos</b> > <b>Administrar e instalar complementos...</b> en el menú principal.",
+            "install_qms": "<b>📍 TAREA INTERACTIVA</b><br><br>Busque <b>QuickMapServices</b> en el Administrador.<br>Instálelo y cierre la ventana.",
+            "add_basemap": "<b>📍 TAREA INTERACTIVA</b><br><br>Ahora haga clic en <b>Web</b> > <b>QuickMapServices</b> en el menú principal y elija un mapa base (ej. OSM Standard).",
+            "success_title": "¡Felicidades!",
+            "success": "Ha instalado un complemento y agregado un mapa base a su proyecto.",
+            "next": "Siguiente",
+            "end": "Terminar Tour",
+            "end_tour_btn": "Cancelar Tour"
+        }
+    }
+    return texts.get(lang, texts["de"])
+
+
+def get_spotlight_steps(iface, lang):
+    """Compiles the sequence of UI elements to highlight for the basic tour."""
+    t = get_texts(lang)
+    main_window = iface.mainWindow()
+    
+    menu_bar = main_window.menuBar()
+    
+    # Locate a visible toolbar (e.g., Map Navigation) to highlight
+    toolbar = iface.mapNavToolToolBar()
+    if not toolbar or not toolbar.isVisible():
+        for tb in main_window.findChildren(QToolBar):
+            if tb.isVisible():
+                toolbar = tb
+                break
+                
+    browser_panel = main_window.findChild(QDockWidget, "Browser")
+    layers_panel = main_window.findChild(QDockWidget, "Layers")
+    map_canvas = iface.mapCanvas()
+    dock_panel = main_window.findChild(QDockWidget, "QgisTourDockWidget")
+    status_bar = main_window.statusBar()
+
+    steps = [
+        {"widget": menu_bar, "text": t["menu"], "btn_next": t["next"], "btn_end_tour": t["end_tour_btn"]}
+    ]
+    
+    if toolbar:
+        steps.append({"widget": toolbar, "text": t["toolbars"], "btn_next": t["next"], "btn_end_tour": t["end_tour_btn"]})
         
-        :param ex_num: Integer indicating the exercise number to display.
-        """
-        self.close_active_tour()
-        self.current_exercise = ex_num
-        self.update_exercise_texts()
-        self.lbl_ex_hint.setVisible(False)
-        self.exercise_frame.setVisible(True)
+    steps.extend([
+        {"widget": browser_panel, "text": t["browser"], "btn_next": t["next"], "btn_end_tour": t["end_tour_btn"]},
+        {"widget": layers_panel, "text": t["layers"], "btn_next": t["next"], "btn_end_tour": t["end_tour_btn"]},
+        {"widget": map_canvas, "text": t["canvas"], "btn_next": t["next"], "btn_end_tour": t["end_tour_btn"]}
+    ])
+    
+    if dock_panel and dock_panel.isVisible():
+        steps.append({"widget": dock_panel, "text": t["dock"], "btn_next": t["next"], "btn_end_tour": t["end_tour_btn"]})
+        
+    steps.append({"widget": status_bar, "text": t["statusbar"], "btn_next": t["end"], "btn_end_tour": t["end_tour_btn"]})
 
-    def open_download_link(self):
-        """Opens the external data download link in the default browser."""
-        url = "https://drive.google.com/file/d/1PgPannrjP2JuDgtKvFBathNstQ-WKmvD/view?usp=sharing"
-        webbrowser.open(url)
+    return steps
+
+def get_interactive_steps(iface, lang):
+    """Compiles the logical sequence for the interactive basemap task."""
+    t = get_texts(lang)
+    steps = []
+    
+    # Only show plugin installation steps if QuickMapServices is missing
+    if "quick_map_services" not in qgis.utils.plugins:
+        steps.append({
+            "interactive": True,
+            "text": t["open_plugin_manager"],
+            "condition_check": is_plugin_manager_open,
+            "btn_end_tour": t["end_tour_btn"]
+        })
+        steps.append({
+            "interactive": True,
+            "text": t["install_qms"],
+            "condition_check": is_qms_installed_and_closed,
+            "btn_end_tour": t["end_tour_btn"]
+        })
+        
+    steps.append({
+        "interactive": True,
+        "text": t["add_basemap"],
+        "condition_check": check_layer_added,
+        "success_msg": t["success"],
+        "success_title": t["success_title"],
+        "btn_end_tour": t["end_tour_btn"]
+    })
+    return steps
