@@ -1,4 +1,4 @@
-# QGIS Learning Assistant (QGIS Lern-Assistent) 
+# Learn QGIS Assistant (QGIS Lern-Assistent) 
 
 This plugin provides beginners with a short tour of the QGIS interface. It is designed to help new users quickly understand the layout of QGIS and perform their first interactive tasks, such as installing plugins and adding basemaps.
 
